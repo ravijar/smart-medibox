@@ -3,6 +3,8 @@
 #include <Adafruit_SSD1306.h>
 #include <DHTesp.h>
 #include <WiFi.h>
+#include <ESP32Servo.h>
+#include <PubSubClient.h>
 
 // oled parameters
 #define SCREEN_WIDTH 128
@@ -13,11 +15,13 @@
 // pin mappings
 #define BUZZER 5
 #define LED 15
-#define PB_CANCEL 34
-#define PB_OK 32
-#define PB_UP 33
-#define PB_DOWN 35
+#define PB_CANCEL 25
+#define PB_OK 27
+#define PB_UP 14
+#define PB_DOWN 26
 #define DHTPIN 12
+#define LDR 34
+#define SERVO 4
 
 // ntp constants
 #define NTP_SERVER     "pool.ntp.org"
@@ -25,6 +29,9 @@
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 DHTesp dht_sensor;
+Servo servo;
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
 
 // time parameters
 int days = 0;
@@ -73,11 +80,26 @@ String modes[] = {
   "Disable   Alarms"
 };
 
-// dht sensor min-max temperature & humidity values
+// dht sensor parameters
 int max_tem = 32;
 int min_tem = 26;
 int max_hum = 80;
 int min_hum = 60;
+char dht22_reading[12];
+
+// ldr parameters
+float max_lux_val = 100916.59;
+float min_lux_val = 0.1;
+const float GAMMA = 0.7;
+const float RL10 = 50;
+char ldr_reading[5];
+
+// servo parameters
+int angle_offset = 30;
+float intensity = 0;
+float control_factor = 0.75;
+
+char initial_sync[9];
 
 void setup() {
   // put your setup code here, to run once:
@@ -87,8 +109,13 @@ void setup() {
   pinMode(PB_OK, INPUT);
   pinMode(PB_UP, INPUT);
   pinMode(PB_DOWN, INPUT);
+  pinMode(LDR, INPUT);
 
+  // initialize dht sensor
   dht_sensor.setup(DHTPIN, DHTesp::DHT22);
+
+  // initialize servo
+  servo.attach(SERVO);
 
   // intitialize OLED display and Serial Monitor
   Serial.begin(115200);
@@ -96,12 +123,49 @@ void setup() {
     Serial.println("SSD1306 allocation failed!");
     for(;;);
   }
-  
-  // turn on OLED display
   display.display();
   delay(2000);
 
-  // initialize wifi
+  setup_WiFi();
+
+  setup_MQTT();
+
+  configTime(utc_offset, UTC_OFFSET_DST, NTP_SERVER);
+
+  sync_dashboard();
+
+  // welcome message
+  display.clearDisplay();
+  print_line("Welcome to MediBox!",0,0,2);
+  delay(2000);
+  
+}
+
+void loop() {
+  // establish mqtt connection
+  if(!mqttClient.connected()){
+    connect_to_broker();
+  }
+  mqttClient.loop();
+
+  update_time_with_check_alarm();
+
+  check_temp();
+
+  move_servo();
+  
+  // mqtt publish
+  mqttClient.publish("MEDIBOX_LDR",ldr_reading);
+  mqttClient.publish("MEDIBOX_DHT22",dht22_reading);
+
+  // go to menu
+  if(digitalRead(PB_OK) == LOW){
+    delay(btn_debounce_delay);
+    go_to_menu();
+  }
+}
+
+void setup_WiFi(){
   WiFi.begin("Wokwi-GUEST", "", 6);
   while (WiFi.status() != WL_CONNECTED) {
     delay(250);
@@ -112,23 +176,94 @@ void setup() {
   display.clearDisplay();
   print_line("CONNECTED TO WIFI!",0,0,1);
   delay(1000);
-
-  configTime(utc_offset, UTC_OFFSET_DST, NTP_SERVER);
-
-  display.clearDisplay();
-  print_line("Welcome to MediBox!",0,0,2);
-  display.clearDisplay();
-  
 }
 
-void loop() {
-  // put your main code here, to run repeatedly:
-  update_time_with_check_alarm();
-  check_temp();
-  if(digitalRead(PB_OK) == LOW){
-    delay(btn_debounce_delay);
-    go_to_menu();
+void setup_MQTT(){
+  mqttClient.setServer("test.mosquitto.org",1883);
+  mqttClient.setCallback(recieve_callback);
+}
+
+void connect_to_broker(){
+  while(!mqttClient.connected()){
+    display.clearDisplay();
+    print_line("Attempting MQTT      connection...",0,0,1);
+    if(mqttClient.connect("ESP32-0000")){
+      print_line("Connected!",0,20,1);
+      delay(1000);
+      // mqtt subscribe
+      mqttClient.subscribe("MINIMUM_ANGLE_CONTROL");
+      mqttClient.subscribe("CONTROLLING_FACTOR_CONTROL");
+    }else{
+      print_line("Failed!",0,20,1);
+      Serial.println(mqttClient.state());
+      delay(5000);
+    }
   }
+}
+
+void recieve_callback(char* topic, byte* payload, unsigned int length){
+  Serial.print("Message arrived [");
+  Serial.print(topic);
+  Serial.print("] ");
+
+  char payload_char_array[length];
+  for(int i=0; i<length; i++){
+    Serial.print(char(payload[i]));
+    payload_char_array[i] = char(payload[i]);
+  }
+  Serial.println();
+
+  if(strcmp(topic,"MINIMUM_ANGLE_CONTROL") == 0){
+    angle_offset = atoi(payload_char_array);
+    // display alert
+    display.clearDisplay();
+    print_line("Minimum Angle",10,10,1);
+    print_line("set to",10,20,1);
+    print_line(String(angle_offset),10,40,2);
+    delay(2000);
+    display.clearDisplay();
+  }
+  if(strcmp(topic,"CONTROLLING_FACTOR_CONTROL") == 0){
+    control_factor = atof(payload_char_array);
+    // display alert
+    display.clearDisplay();
+    print_line("Controlling Factor",10,10,1);
+    print_line("set to",10,20,1);
+    print_line(String(control_factor),10,40,2);
+    delay(2000);
+    display.clearDisplay();
+  }
+}
+
+void sync_dashboard(){
+  // syncs the dashboard shade controller sliders at startup
+  (String(angle_offset)+" "+String(control_factor)).toCharArray(initial_sync, 9);
+  if(!mqttClient.connected()){
+    connect_to_broker();
+  }
+  mqttClient.publish("INITIAL_SYNC",initial_sync);
+}
+
+float get_lux_value(int analog_value){
+  // converts the analog value given by ldr to lux value
+  // reference : https://docs.wokwi.com/parts/wokwi-photoresistor-sensor
+  // voltage changed according to esp32 considering the table in above reference
+  float voltage = analog_value / (4.0*1024) * 5;
+  float resistance = 2000 * voltage / (1 - voltage / 5);
+  return pow(RL10 * 1e3 * pow(10, GAMMA) / resistance, (1 / GAMMA));
+}
+
+void update_intensity(){
+  float data = get_lux_value(analogRead(LDR));
+  // taking intensity to 0 --> 1 range
+  intensity = (data - min_lux_val)/(max_lux_val - min_lux_val);
+  String(intensity, 2).toCharArray(ldr_reading, 5);
+}
+
+void move_servo(){
+  update_intensity();
+  float angle = angle_offset + (180 - angle_offset)*intensity*control_factor;
+  servo.write(angle);
 }
 
 void print_line(String text, int column, int row, int text_Size){
@@ -447,6 +582,8 @@ void check_temp(){
   TempAndHumidity data = dht_sensor.getTempAndHumidity();
   float tem = data.temperature;
   float hum = data.humidity;
+  (String(tem,1) + " " +String(hum,1)).toCharArray(dht22_reading,12);
+
   bool danger = true;
   String output = "";
 
